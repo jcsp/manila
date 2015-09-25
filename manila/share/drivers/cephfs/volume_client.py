@@ -114,7 +114,17 @@ class CephFSVolumeClient(object):
     def __del__(self):
         self.disconnect()
 
-    def create_volume(self, volume_name):
+    def create_volume(self, volume_name, size=None):
+        """
+        Set up metadata, pools and auth for a volume.
+
+        This function is idempotent.  It is safe to call this again
+        for an already-created volume, even if it is in use.
+
+        :param volume_name: Any string.  Must be unique per volume.
+        :param size: In bytes, or None for no size limit
+        :return:
+        """
         log.info("create_volume: {0}".format(volume_name))
         try:
             self.fs.stat(self.VOLUME_PREFIX)
@@ -156,7 +166,9 @@ class CephFSVolumeClient(object):
             self.fs.mkdir(os.path.join(self.VOLUME_PREFIX, volume_name), 0755)
         else:
             log.warning("Volume {0} already exists".format(volume_name))
-            return None
+
+        if size is not None:
+            self.fs.setxattr(volume_path, 'ceph.quota.max_bytes', size.__str__(), 0)
 
         return {
             'volume_name': volume_name,
@@ -165,6 +177,13 @@ class CephFSVolumeClient(object):
         }
 
     def delete_volume(self, volume_name):
+        """
+        Remove all trace of a volume from the Ceph cluster.  This function is
+        idempotent.
+
+        :param volume_name: Same name used in create_volume
+        :return:
+        """
         log.info("delete_volume: {0}".format(volume_name))
 
         client_entity = "client.{0}".format(volume_name)

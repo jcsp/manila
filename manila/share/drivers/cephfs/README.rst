@@ -45,6 +45,9 @@ Using the mon IP addresses from your export location, create a ceph.conf file li
 
 ::
 
+    [client]
+            client quota = true
+
     [mon.a]
             mon addr = 192.168.1.7:6789
 

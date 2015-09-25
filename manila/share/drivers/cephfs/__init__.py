@@ -23,8 +23,11 @@ from oslo_log import log
 log = log.getLogger(__name__)
 
 
+GIGABYTES = 1024 * 1024 * 1024
+
 # TODO consistency groups: use a parent dir to define consistency group, then
 # directory within that for each share?
+
 
 class CephFSNativeDriver(driver.ShareDriver,):
     """
@@ -81,8 +84,12 @@ class CephFSNativeDriver(driver.ShareDriver,):
         log.info("create_share {0}".format(share['name']))
 
         name = share['name']
-        volume = self.volume_client.create_volume(name)
+        if share['size']:
+            size = share['size'] * GIGABYTES
+        else:
+            size = None
 
+        volume = self.volume_client.create_volume(volume_name=name, size=size)
 
         # To mount this you need to know the mon IPs, the volume name, and they key
         key = volume['volume_key']
@@ -103,10 +110,11 @@ class CephFSNativeDriver(driver.ShareDriver,):
         # is potentially pretty slow).
 
     def ensure_share(self, context, share, share_server=None):
-        # TODO lets check the dir an auth exist
-        pass
+        # Creation is idempotent
+        assert share is not None
+        return self.create_share(context, share, share_server)
 
     def __del__(self):
-        if self.volume_client:
-            self.volume_client.disconnect()
-            self.volume_client = None
+        if self._volume_client:
+            self._volume_client.disconnect()
+            self._volume_client = None
