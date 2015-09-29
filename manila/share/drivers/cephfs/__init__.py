@@ -77,19 +77,17 @@ class CephFSNativeDriver(driver.ShareDriver,):
         """
         assert share_server is None
 
-        # TODO carry forward e.g. project_id from RequestContext into
-        # some metadata in Ceph and/or metadata for the client mount?
-
         # `share` is a ShareInstance
-        log.info("create_share {0}".format(share['name']))
+        log.info("create_share name={0} size={1} cg_id={2}".format(
+            share['share_id'], share['size'], share['consistency_group_id']))
 
-        name = share['name']
+        name = share['share_id']
         if share['size']:
             size = share['size'] * GIGABYTES
         else:
             size = None
 
-        volume = self.volume_client.create_volume(volume_name=name, size=size)
+        volume = self.volume_client.create_volume(volume_name=name, size=size, data_isolated=True)
 
         # To mount this you need to know the mon IPs, the volume name, and they key
         key = volume['volume_key']
@@ -105,9 +103,7 @@ class CephFSNativeDriver(driver.ShareDriver,):
         return export_location
 
     def delete_share(self, context, share, share_server=None):
-        self.volume_client.delete_volume(share['name'])
-        # TODO: clear out the _deleting directory in the background (rm -rf
-        # is potentially pretty slow).
+        self.volume_client.delete_volume(share['share_id'], data_isolated=True)
 
     def ensure_share(self, context, share, share_server=None):
         # Creation is idempotent

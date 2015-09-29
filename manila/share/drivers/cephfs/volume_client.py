@@ -59,6 +59,7 @@ class CephFSVolumeClient(object):
     VOLUME_PREFIX = "/volumes"
     RADOS_NAME = "client.manila"
     CLUSTER_NAME = 'ceph'
+    POOL_PREFIX = "manila_"
 
     def __init__(self):
         self.fs = None
@@ -66,6 +67,9 @@ class CephFSVolumeClient(object):
         self.connected = False
 
     def connect(self):
+        # TODO: optionally evict any other CephFS client with my client ID
+        # so that a hard restart of manila doesn't have to wait for its
+        # previous client instance's session to time out.
         log.debug("Connecting to RADOS...")
         self.rados = rados.Rados(
             name=self.RADOS_NAME,
@@ -114,7 +118,69 @@ class CephFSVolumeClient(object):
     def __del__(self):
         self.disconnect()
 
-    def create_volume(self, volume_name, size=None):
+    def _get_pool_id(self, osd_map, pool_name):
+        # Maybe borrow the OSDMap wrapper class from calamari if more helpers like this aren needed.
+        for pool in osd_map['pools']:
+            if pool['pool_name'] == pool_name:
+                return pool['pool']
+
+        return None
+
+    def _create_volume_pool(self, pool_name):
+        """
+        Idempotently create a pool for use as a CephFS data pool, with the given name
+
+        :return The ID of the created pool
+        """
+        osd_map = self._rados_command('osd dump', {})
+
+        existing_id = self._get_pool_id(osd_map, pool_name)
+        if existing_id is not None:
+            log.info("Pool {0} already exists".format(pool_name))
+            return existing_id
+
+        osd_count = len(osd_map['osds'])
+
+        # We can't query the actual cluster config remotely, but since this is
+        # just a heuristic we'll assume that the ceph.conf we have locally reflects
+        # that in use in the rest of the cluster.
+        pg_warn_max_per_osd = int(self.rados.conf_get('mon_pg_warn_max_per_osd'))
+
+        other_pgs = 0
+        for pool in osd_map['pools']:
+            if not pool['pool_name'].startswith(self.POOL_PREFIX):
+                other_pgs += pool['pg_num']
+
+        # A basic heuristic for picking pg_num: work out the max number of
+        # PGs we can have without tripping a warning, then subtract the number
+        # of PGs already created by non-manila pools, then divide by ten.  That'll
+        # give you a reasonable result on a system where you have "a few" manila
+        # shares.
+        pg_num = ((pg_warn_max_per_osd * osd_count) - other_pgs) / 10
+        # TODO Alternatively, respect an override set by the user.
+
+        self._rados_command(
+            'osd pool create',
+            {
+                'pool': pool_name,
+                'pg_num': pg_num
+            }
+        )
+
+        osd_map = self._rados_command('osd dump', {})
+        pool_id = self._get_pool_id(osd_map, pool_name)
+
+        if pool_id is None:
+            # If the pool isn't there, that's either a ceph bug, or it's some outside influence
+            # removing it right after we created it.
+            log.error("OSD map doesn't contain expected pool '{0}':\n{1}".format(
+                pool_name, json.dumps(osd_map, indent=2)
+            ))
+            raise RuntimeError("Pool '{0}' not present in map after creation".format(pool_name))
+        else:
+            return pool_id
+
+    def create_volume(self, volume_name, size=None, data_isolated=False):
         """
         Set up metadata, pools and auth for a volume.
 
@@ -123,6 +189,7 @@ class CephFSVolumeClient(object):
 
         :param volume_name: Any string.  Must be unique per volume.
         :param size: In bytes, or None for no size limit
+        :param data_isolated: If true, create a separate OSD pool for this volume
         :return:
         """
         log.info("create_volume: {0}".format(volume_name))
@@ -170,13 +237,23 @@ class CephFSVolumeClient(object):
         if size is not None:
             self.fs.setxattr(volume_path, 'ceph.quota.max_bytes', size.__str__(), 0)
 
+        if data_isolated:
+            pool_name = "{0}{1}".format(self.POOL_PREFIX, volume_name)
+            pool_id = self._create_volume_pool(pool_name)
+            mds_map = self._rados_command("mds dump", {})
+            if pool_id not in mds_map['data_pools']:
+                self._rados_command("mds add_data_pool", {
+                    'pool': pool_name
+                })
+            self.fs.setxattr(volume_path, 'ceph.dir.layout.pool', pool_name, 0)
+
         return {
             'volume_name': volume_name,
             'volume_key': volume_key,
             'mount_path': volume_path
         }
 
-    def delete_volume(self, volume_name):
+    def delete_volume(self, volume_name, data_isolated=False):
         """
         Remove all trace of a volume from the Ceph cluster.  This function is
         idempotent.
@@ -184,6 +261,10 @@ class CephFSVolumeClient(object):
         :param volume_name: Same name used in create_volume
         :return:
         """
+
+        # TODO: evict any clients that were using this: deleting the auth key
+        # will stop new clients connecting, but it doesn't guarantee that any
+        # existing clients have gone.
         log.info("delete_volume: {0}".format(volume_name))
 
         client_entity = "client.{0}".format(volume_name)
@@ -198,16 +279,60 @@ class CephFSVolumeClient(object):
         except cephfs.ObjectNotFound:
             self.fs.mkdir(trash, 0755)
 
+        # We'll move it to here
+        trashed_volume = os.path.join(trash, volume_name)
+
         # Move the volume's data to the trash folder
         volume_path = os.path.join(self.VOLUME_PREFIX, volume_name)
         try:
             self.fs.stat(volume_path)
         except cephfs.ObjectNotFound:
             log.warning("Trying to delete volume '{0}' but it's already gone".format(
-                volume_name
-            ))
+                volume_path))
         else:
-            self.fs.rename(volume_path, os.path.join(trash, volume_name))
+            self.fs.rename(volume_path, trashed_volume)
+
+        try:
+            self.fs.stat(trashed_volume)
+        except cephfs.ObjectNotFound:
+            log.warning("Trying to purge volume '{0}' but it's already been purged".format(
+                trashed_volume))
+            return
+
+        def rmtree(root_path):
+            log.debug("rmtree {0}".format(root_path))
+            dir_handle = self.fs.opendir(root_path)
+            d = self.fs.readdir(dir_handle)
+            while d:
+                if d.d_name not in [".", ".."]:
+                    d_full = os.path.join(root_path, d.d_name)
+                    if d.is_dir():
+                        rmtree(d_full)
+                    else:
+                        self.fs.unlink(d_full)
+
+                d = self.fs.readdir(dir_handle)
+            self.fs.closedir(dir_handle)
+
+            self.fs.rmdir(root_path)
+
+        rmtree(trashed_volume)
+
+        if data_isolated:
+            pool_name = "{0}{1}".format(self.POOL_PREFIX, volume_name)
+            osd_map = self._rados_command("osd dump", {})
+            pool_id = self._get_pool_id(osd_map, pool_name)
+            mds_map = self._rados_command("mds dump", {})
+            if pool_id in mds_map['data_pools']:
+                self._rados_command("mds remove_data_pool", {
+                    'pool': pool_name
+                })
+            self._rados_command("osd pool delete",
+                                {
+                                    "pool": pool_name,
+                                    "pool2": pool_name,
+                                    "sure": "--yes-i-really-really-mean-it"
+                                })
 
     def _rados_command(self, prefix, args=None, decode=True):
         """
