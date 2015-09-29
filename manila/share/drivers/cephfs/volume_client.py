@@ -373,6 +373,16 @@ class CephFSVolumeClient(object):
             else:
                 return outbuf
 
+    def get_used_bytes(self, volume_name):
+        volume_path = os.path.join(self.VOLUME_PREFIX, volume_name)
+        return int(self.fs.getxattr(volume_path, "ceph.dir.rbytes"))
+
+    def set_max_bytes(self, volume_name, max_bytes):
+        volume_path = os.path.join(self.VOLUME_PREFIX, volume_name)
+        self.fs.setxattr(volume_path, 'ceph.quota.max_bytes',
+                         max_bytes.__str__() if max_bytes is not None else "0",
+                         0)
+
 if __name__ == '__main__':
     log.setLevel(logging.DEBUG)
     log.addHandler(logging.StreamHandler())

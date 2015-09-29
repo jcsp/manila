@@ -14,7 +14,7 @@
 #    under the License.
 import json
 
-from manila.exception import ManilaException
+import manila.exception as exception
 from manila.share import driver
 
 
@@ -22,8 +22,6 @@ from manila.share import driver
 from oslo_log import log
 log = log.getLogger(__name__)
 
-
-GIGABYTES = 1024 * 1024 * 1024
 
 # TODO consistency groups: use a parent dir to define consistency group, then
 # directory within that for each share?
@@ -38,6 +36,19 @@ class CephFSNativeDriver(driver.ShareDriver,):
 
     driver_handles_share_servers = True
 
+    def _to_bytes(self, gigs):
+        """
+        Convert a Manila size into bytes.  Manila uses gigs everywhere.  If the input
+        is None, return None.
+
+        :param gigs: integer number of gigabytes
+        :return: integer number of bytes
+        """
+        if gigs is not None:
+            return gigs * 1024 * 1024 * 1024
+        else:
+            return None
+
     @property
     def volume_client(self):
         if self._volume_client:
@@ -46,7 +57,7 @@ class CephFSNativeDriver(driver.ShareDriver,):
         try:
             from volume_client import CephFSVolumeClient
         except ImportError as e:
-            raise ManilaException(
+            raise exception.ManilaException(
                 "Ceph client libraries not found: {0}".format(
                     e
                 )
@@ -82,10 +93,7 @@ class CephFSNativeDriver(driver.ShareDriver,):
             share['share_id'], share['size'], share['consistency_group_id']))
 
         name = share['share_id']
-        if share['size']:
-            size = share['size'] * GIGABYTES
-        else:
-            size = None
+        size = self._to_bytes(share['size'])
 
         volume = self.volume_client.create_volume(volume_name=name, size=size, data_isolated=True)
 
@@ -109,6 +117,23 @@ class CephFSNativeDriver(driver.ShareDriver,):
         # Creation is idempotent
         assert share is not None
         return self.create_share(context, share, share_server)
+
+    def extend_share(self, share, new_size, share_server=None):
+        log.info("extend_share {0} {1}".format(share['share_id'], new_size))
+        self.volume_client.set_max_bytes(share['share_id'], self._to_bytes(new_size))
+
+    def shrink_share(self, share, new_size, share_server=None):
+        log.info("shrink_share {0} {1}".format(share['share_id'], new_size))
+        new_bytes = self._to_bytes(new_size)
+        used = self.volume_client.get_used_bytes(share['share_id'])
+        if used > new_bytes:
+            # While in fact we can "shrink" our volumes to less than their
+            # used bytes (it's just a quota), raise error anyway to avoid
+            # confusing API consumers that might depend on typical shrink
+            # behaviour.
+            raise exception.ShareShrinkingPossibleDataLoss()
+
+        self.volume_client.set_max_bytes(share['share_id'], new_bytes)
 
     def __del__(self):
         if self._volume_client:
