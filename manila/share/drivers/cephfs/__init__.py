@@ -12,22 +12,32 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-import json
-import datetime
+
+
+from oslo_log import log
+from oslo_config import cfg
 
 import manila.exception as exception
 from manila.share import driver
 
 
 
-from oslo_log import log
-from manila.share.drivers.cephfs.volume_client import VolumePath
-
 log = log.getLogger(__name__)
 
 
-# TODO consistency groups: use a parent dir to define consistency group, then
-# directory within that for each share?
+cephfs_native_opts = [
+    cfg.StrOpt('cephfs_conf_path',
+               default="",
+               help=""),
+    cfg.StrOpt('cephfs_cluster_name',
+               default=None,
+               help="The name of the cluster in use, if it is not the default ('ceph')"
+               )
+]
+
+
+CONF = cfg.CONF
+CONF.register_opts(cephfs_native_opts)
 
 
 class CephFSNativeDriver(driver.ShareDriver,):
@@ -74,10 +84,17 @@ class CephFSNativeDriver(driver.ShareDriver,):
                 )
             )
         else:
-            self._volume_client = CephFSVolumeClient()
+            conf_path = self.configuration.safe_get('cephfs_conf_path')
+            cluster_name = self.configuration.safe_get('cephfs_cluster_name')
+            self._volume_client = CephFSVolumeClient(conf_path, cluster_name)
             log.info("Ceph client found, connecting...")
-            self._volume_client.connect()
-            log.info("Ceph client connection complete")
+            try:
+                self._volume_client.connect()
+            except Exception:
+                self._volume_client = None
+                raise
+            else:
+                log.info("Ceph client connection complete")
 
             return self._volume_client
 
@@ -89,10 +106,13 @@ class CephFSNativeDriver(driver.ShareDriver,):
 
         self._volume_client = None
 
+        self.configuration.append_config_values(cephfs_native_opts)
+
     def _share_path(self, share):
         """
         Get VolumePath from ShareInstance
         """
+        from manila.share.drivers.cephfs.volume_client import VolumePath
         return VolumePath(share['consistency_group_id'], share['share_id'])
 
     def _teardown_server(self, server_details, security_services=None):

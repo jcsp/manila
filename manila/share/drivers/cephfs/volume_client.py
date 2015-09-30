@@ -91,13 +91,14 @@ class CephFSVolumeClient(object):
     # Where shall we create our volumes?
     VOLUME_PREFIX = "/volumes"
     RADOS_NAME = "client.manila"
-    CLUSTER_NAME = 'ceph'
     POOL_PREFIX = "manila_"
 
-    def __init__(self):
+    def __init__(self, conf_path, cluster_name):
         self.fs = None
         self.rados = None
         self.connected = False
+        self.conf_path = conf_path
+        self.cluster_name = cluster_name
 
     def _get_path(self, volume_path):
         """
@@ -119,14 +120,12 @@ class CephFSVolumeClient(object):
         # TODO: optionally evict any other CephFS client with my client ID
         # so that a hard restart of manila doesn't have to wait for its
         # previous client instance's session to time out.
-        log.debug("Connecting to RADOS...")
+        log.debug("Connecting to RADOS with config {0}...".format(self.conf_path))
         self.rados = rados.Rados(
             name=self.RADOS_NAME,
-            clustername=self.CLUSTER_NAME,
-            conffile='',
-            conf={
-                'keyring': "./keyring.manila"
-            }
+            clustername=self.cluster_name,
+            conffile=self.conf_path,
+            conf={}
         )
         self.rados.connect()
 
