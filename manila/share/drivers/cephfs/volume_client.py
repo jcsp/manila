@@ -41,11 +41,33 @@ class RadosError(Exception):
 
 RADOS_TIMEOUT = 10
 
+SNAP_DIR = ".snap"
+
 log = logging.getLogger(__name__)
 
 
 # TODO support multiple ceph clusters
 # TODO get ceph auth info from config database
+
+# Reserved volume group name which we use in paths for volumes
+# that
+NO_GROUP_NAME = "_nogroup"
+
+
+class VolumePath(object):
+    """
+    Identify a volume's path as group->volume
+    The Volume ID is a unique identifier, but this is a much more
+    helpful thing to pass around.
+    """
+    def __init__(self, group_id, volume_id):
+        self.group_id = group_id
+        self.volume_id = volume_id
+        assert self.group_id != NO_GROUP_NAME
+
+    def __str__(self):
+        return "{0}/{1}".format(self.group_id, self.volume_id)
+
 
 class CephFSVolumeClient(object):
     """
@@ -53,6 +75,17 @@ class CephFSVolumeClient(object):
     'Volume' concept implemented as a cephfs directory and
     client capabilities which restrict mount access to this
     directory.
+
+    Additionally, volumes may be in a 'Group'.  Conveniently,
+    volumes are a lot like manila shares, and groups are a lot
+    like manila consistency groups.
+
+    Refer to volumes with VolumePath, which specifies the
+    volume and group IDs (both strings).  The group ID may
+    be None.
+
+    In general, functions in this class are allowed raise rados.Error
+    or cephfs.Error exceptions in unexpected situations.
     """
 
     # Where shall we create our volumes?
@@ -65,6 +98,22 @@ class CephFSVolumeClient(object):
         self.fs = None
         self.rados = None
         self.connected = False
+
+    def _get_path(self, volume_path):
+        """
+        Determine the path within CephFS where this volume will live
+        :return: absolute path (string)
+        """
+        return os.path.join(
+            self.VOLUME_PREFIX,
+            volume_path.group_id if volume_path.group_id is not None else NO_GROUP_NAME,
+            volume_path.volume_id)
+
+    def _get_group_path(self, group_id):
+        return os.path.join(
+            self.VOLUME_PREFIX,
+            group_id
+        )
 
     def connect(self):
         # TODO: optionally evict any other CephFS client with my client ID
@@ -112,8 +161,6 @@ class CephFSVolumeClient(object):
             self.rados.shutdown()
             self.rados = None
             log.debug("Disconnecting rados complete")
-
-        time.sleep(5)
 
     def __del__(self):
         self.disconnect()
@@ -180,34 +227,87 @@ class CephFSVolumeClient(object):
         else:
             return pool_id
 
-    def create_volume(self, volume_name, size=None, data_isolated=False):
+    def create_group(self, group_id):
+        path = self._get_group_path(group_id)
+        self._mkdir_p(path)
+
+    def destroy_group(self, group_id):
+        # TODO: check that manila calls snapshot remove methods first,
+        # or do we have to delete snapshots first ourselves?
+        path = self._get_group_path(group_id)
+        try:
+            self.fs.stat(self.VOLUME_PREFIX)
+        except cephfs.ObjectNotFound:
+            pass
+        else:
+            self.fs.rmdir(path)
+
+    def _mkdir_p(self, path):
+        try:
+            self.fs.stat(path)
+        except cephfs.ObjectNotFound:
+            pass
+        else:
+            return
+
+        parts = os.path.split(path)
+        for i in range(1, len(parts) + 1):
+            subpath = os.path.join(*parts[0:i])
+            try:
+                self.fs.stat(subpath)
+            except cephfs.ObjectNotFound:
+                self.fs.mkdir(subpath, 0755)
+
+    def create_volume(self, volume_path, size=None, data_isolated=False):
         """
         Set up metadata, pools and auth for a volume.
 
         This function is idempotent.  It is safe to call this again
         for an already-created volume, even if it is in use.
 
-        :param volume_name: Any string.  Must be unique per volume.
+        :param volume_path: VolumePath instance
         :param size: In bytes, or None for no size limit
         :param data_isolated: If true, create a separate OSD pool for this volume
         :return:
         """
-        log.info("create_volume: {0}".format(volume_name))
+        log.info("create_volume: {0}".format(volume_path))
+        client_entity = "client.{0}".format(volume_path.volume_id)
+        path = self._get_path(volume_path)
+
+        # Fast pre-check: if the auth key (last thing created) exists, then
+        # the rest of the volume already exists too.
         try:
-            self.fs.stat(self.VOLUME_PREFIX)
-        except cephfs.ObjectNotFound:
-            self.fs.mkdir(self.VOLUME_PREFIX, 0755)
+            auth = self._rados_command("auth get", {"entity": client_entity})[0]
+        except rados.Error:
+            pass
+        else:
+            log.info("create_volume: {0} already exists, returning")
+            return {
+                'volume_key': auth['key'],
+                'mount_path': path
+            }
 
-        client_entity = "client.{0}".format(volume_name)
+        self._mkdir_p(path)
 
-        volume_path = os.path.join(self.VOLUME_PREFIX, volume_name)
+        if size is not None:
+            self.fs.setxattr(path, 'ceph.quota.max_bytes', size.__str__(), 0)
+
+        if data_isolated:
+            pool_name = "{0}{1}".format(self.POOL_PREFIX, volume_path.volume_id)
+            pool_id = self._create_volume_pool(pool_name)
+            mds_map = self._rados_command("mds dump", {})
+            if pool_id not in mds_map['data_pools']:
+                self._rados_command("mds add_data_pool", {
+                    'pool': pool_name
+                })
+            self.fs.setxattr(path, 'ceph.dir.layout.pool', pool_name, 0)
 
         caps = self._rados_command(
             'auth get-or-create',
             {
                 'entity': client_entity,
                 'caps': [
-                    'mds', 'allow rw path={0}'.format(volume_path),
+                    'mds', 'allow rw path={0}'.format(path),
                     'osd', 'allow rw',
                     'mon', 'allow r']
             })
@@ -227,70 +327,46 @@ class CephFSVolumeClient(object):
         assert caps[0]['entity'] == client_entity
         volume_key = caps[0]['key']
 
-        try:
-            self.fs.stat(volume_path)
-        except cephfs.ObjectNotFound:
-            self.fs.mkdir(os.path.join(self.VOLUME_PREFIX, volume_name), 0755)
-        else:
-            log.warning("Volume {0} already exists".format(volume_name))
-
-        if size is not None:
-            self.fs.setxattr(volume_path, 'ceph.quota.max_bytes', size.__str__(), 0)
-
-        if data_isolated:
-            pool_name = "{0}{1}".format(self.POOL_PREFIX, volume_name)
-            pool_id = self._create_volume_pool(pool_name)
-            mds_map = self._rados_command("mds dump", {})
-            if pool_id not in mds_map['data_pools']:
-                self._rados_command("mds add_data_pool", {
-                    'pool': pool_name
-                })
-            self.fs.setxattr(volume_path, 'ceph.dir.layout.pool', pool_name, 0)
-
         return {
-            'volume_name': volume_name,
             'volume_key': volume_key,
-            'mount_path': volume_path
+            'mount_path': path
         }
 
-    def delete_volume(self, volume_name, data_isolated=False):
+    def delete_volume(self, volume_path, data_isolated=False):
         """
         Remove all trace of a volume from the Ceph cluster.  This function is
         idempotent.
 
-        :param volume_name: Same name used in create_volume
+        :param volume_path: Same identifier used in create_volume
         :return:
         """
 
         # TODO: evict any clients that were using this: deleting the auth key
         # will stop new clients connecting, but it doesn't guarantee that any
         # existing clients have gone.
-        log.info("delete_volume: {0}".format(volume_name))
+        log.info("delete_volume: {0}".format(volume_path))
 
-        client_entity = "client.{0}".format(volume_name)
+        client_entity = "client.{0}".format(volume_path.volume_id)
 
         # Remove the auth key for this volume
         self._rados_command('auth del', {'entity': client_entity}, decode=False)
 
         # Create the trash folder if it doesn't already exist
         trash = os.path.join(self.VOLUME_PREFIX, "_deleting")
-        try:
-            self.fs.stat(trash)
-        except cephfs.ObjectNotFound:
-            self.fs.mkdir(trash, 0755)
+        self._mkdir_p(trash)
 
         # We'll move it to here
-        trashed_volume = os.path.join(trash, volume_name)
+        trashed_volume = os.path.join(trash, volume_path.volume_id)
 
         # Move the volume's data to the trash folder
-        volume_path = os.path.join(self.VOLUME_PREFIX, volume_name)
+        path = self._get_path(volume_path)
         try:
-            self.fs.stat(volume_path)
+            self.fs.stat(path)
         except cephfs.ObjectNotFound:
             log.warning("Trying to delete volume '{0}' but it's already gone".format(
-                volume_path))
+                path))
         else:
-            self.fs.rename(volume_path, trashed_volume)
+            self.fs.rename(path, trashed_volume)
 
         try:
             self.fs.stat(trashed_volume)
@@ -298,6 +374,12 @@ class CephFSVolumeClient(object):
             log.warning("Trying to purge volume '{0}' but it's already been purged".format(
                 trashed_volume))
             return
+
+        # TODO: delete the consistency group if it's empty now
+        # TODO: we must delete all the snapshots explicitly during purge
+
+        # FIXME: warn somehow that when someone deletes a volume that was in a consistency group,
+        # we can't clear out snapshots until the consistency group is empty?
 
         def rmtree(root_path):
             log.debug("rmtree {0}".format(root_path))
@@ -319,7 +401,7 @@ class CephFSVolumeClient(object):
         rmtree(trashed_volume)
 
         if data_isolated:
-            pool_name = "{0}{1}".format(self.POOL_PREFIX, volume_name)
+            pool_name = "{0}{1}".format(self.POOL_PREFIX, volume_path.volume_id)
             osd_map = self._rados_command("osd dump", {})
             pool_id = self._get_pool_id(osd_map, pool_name)
             mds_map = self._rados_command("mds dump", {})
@@ -373,22 +455,45 @@ class CephFSVolumeClient(object):
             else:
                 return outbuf
 
-    def get_used_bytes(self, volume_name):
-        volume_path = os.path.join(self.VOLUME_PREFIX, volume_name)
-        return int(self.fs.getxattr(volume_path, "ceph.dir.rbytes"))
+    def get_used_bytes(self, volume_path):
+        return int(self.fs.getxattr(self._get_path(volume_path), "ceph.dir.rbytes"))
 
-    def set_max_bytes(self, volume_name, max_bytes):
-        volume_path = os.path.join(self.VOLUME_PREFIX, volume_name)
-        self.fs.setxattr(volume_path, 'ceph.quota.max_bytes',
+    def set_max_bytes(self, volume_path, max_bytes):
+        self.fs.setxattr(self._get_path(volume_path), 'ceph.quota.max_bytes',
                          max_bytes.__str__() if max_bytes is not None else "0",
                          0)
 
-if __name__ == '__main__':
-    log.setLevel(logging.DEBUG)
-    log.addHandler(logging.StreamHandler())
+    def _snapshot_path(self, dir_path, snapshot_name):
+        return os.path.join(
+            dir_path, SNAP_DIR, snapshot_name
+        )
 
-    import sys
-    vc = CephFSVolumeClient()
-    vc.connect()
-    vc.create_volume(sys.argv[1])
-    vc.disconnect()
+    def _snapshot_create(self, dir_path, snapshot_name):
+        self.fs.mkdir(self._snapshot_path(dir_path, snapshot_name), 0755)
+
+    def _snapshot_destroy(self, dir_path, snapshot_name):
+        """
+        Remove a snapshot, or do nothing if it already doesn't exist.
+        """
+        try:
+            self.fs.rmdir(self._snapshot_path(dir_path, snapshot_name))
+        except cephfs.ObjectNotFound:
+            log.warn("Snapshot was already gone: {0}".format(snapshot_name))
+
+    def create_snapshot_volume(self, volume_path, snapshot_name):
+        self._snapshot_create(self._get_path(volume_path), snapshot_name)
+
+    def destroy_snapshot_volume(self, volume_path, snapshot_name):
+        self._snapshot_destroy(self._get_path(volume_path), snapshot_name)
+
+    def create_snapshot_group(self, group_id, snapshot_name):
+        if group_id is None:
+            raise RuntimeError("Group ID may not be None")
+
+        return self._snapshot_create(self._get_group_path(group_id), snapshot_name)
+
+    def destroy_snapshot_group(self, group_id, snapshot_name):
+        if group_id is None:
+            raise RuntimeError("Group ID may not be None")
+
+        return self._snapshot_destroy(self._get_group_path(group_id), snapshot_name)

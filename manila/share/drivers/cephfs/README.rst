@@ -16,6 +16,27 @@ Prerequisities
 - Network connectivity between your Ceph cluster's public network and your manila server
 - Network connectivity between your Ceph cluster's public network and guests
 
+.. important:: A Manila share backed onto CephFS is only as good as the underlying filesystem.  Take
+               care when configuring your Ceph cluster, and consult the latest guidance on the use of
+               CephFS in the Ceph documentation (http://docs.ceph.com/docs/master/cephfs/)
+
+Authorize the driver to communicate with Ceph
+=============================================
+
+::
+
+    ceph auth get-or-create client.manila mon 'allow *' mds 'allow *' > keyring.manila
+
+keyring.manila, along with your ceph.conf file, will then need to be placed
+on your manila server, and the paths to these configured in your manila.conf.
+
+
+Enable snapshots in Ceph, if you want to use them in Manila:
+
+::
+
+    ceph mds set allow_new_snaps true --yes-i-really-mean-i
+
 Configure CephFS Backend in manila.conf
 =======================================
 
