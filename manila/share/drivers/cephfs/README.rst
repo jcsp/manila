@@ -25,7 +25,7 @@ Authorize the driver to communicate with Ceph
 
 ::
 
-    ceph auth get-or-create client.manila mon 'allow *' mds 'allow *' > keyring.manila
+    ceph auth get-or-create client.manila mon 'allow *' mds 'allow *' osd 'allow rw' > keyring.manila
 
 keyring.manila, along with your ceph.conf file, will then need to be placed
 on your manila server, and the paths to these configured in your manila.conf.

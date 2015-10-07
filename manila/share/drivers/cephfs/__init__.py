@@ -32,7 +32,11 @@ cephfs_native_opts = [
     cfg.StrOpt('cephfs_cluster_name',
                default=None,
                help="The name of the cluster in use, if it is not the default ('ceph')"
-               )
+               ),
+    cfg.StrOpt('cephfs_auth_id',
+               default="manila",
+               help="The name of the ceph auth identity to use.  Default 'manila'."
+               ),
 ]
 
 
@@ -49,6 +53,9 @@ class CephFSNativeDriver(driver.ShareDriver,):
     supported_protocols = ('CEPHFS',)
 
     driver_handles_share_servers = True
+
+    # We support snapshots, but not creating shares from them (yet)
+    _snapshots_are_supported = True
 
     def get_share_stats(self, refresh=False):
         data = super(CephFSNativeDriver, self).get_share_stats(refresh)
@@ -86,7 +93,8 @@ class CephFSNativeDriver(driver.ShareDriver,):
         else:
             conf_path = self.configuration.safe_get('cephfs_conf_path')
             cluster_name = self.configuration.safe_get('cephfs_cluster_name')
-            self._volume_client = CephFSVolumeClient(conf_path, cluster_name)
+            auth_id = self.configuration.safe_get('cephfs_auth_id')
+            self._volume_client = CephFSVolumeClient(auth_id, conf_path, cluster_name)
             log.info("Ceph client found, connecting...")
             try:
                 self._volume_client.connect()
@@ -100,7 +108,7 @@ class CephFSNativeDriver(driver.ShareDriver,):
 
     def __init__(self, *args, **kwargs):
         super(CephFSNativeDriver, self).__init__(
-            True, *args, **kwargs)
+            False, *args, **kwargs)
         self.backend_name = self.configuration.safe_get(
             'share_backend_name') or 'CephFS-Native'
 
@@ -195,15 +203,6 @@ class CephFSNativeDriver(driver.ShareDriver,):
         self.volume_client.destroy_snapshot_volume(self._share_path(snapshot['share']), snapshot['name'])
         return None
 
-    def create_share_from_snapshot(self, context, share, snapshot, share_server=None):
-        # TODO
-        # Create the new share as requested
-
-        # cp -r from the snapshot to the new share
-
-        raise NotImplementedError()
-
-
     def create_consistency_group_from_cgsnapshot(self, context, cg_dict, cgsnapshot_dict, share_server=None):
         # TODO
         raise NotImplementedError()
@@ -217,13 +216,15 @@ class CephFSNativeDriver(driver.ShareDriver,):
     def delete_cgsnapshot(self, context, snap_dict, share_server=None):
         self.volume_client.destroy_snapshot_group(
             snap_dict['consistency_group_id'],
-            snap_dict['name']
+            snap_dict['id']
         )
+
+        return None, []
 
     def create_cgsnapshot(self, context, snap_dict, share_server=None):
         self.volume_client.create_snapshot_group(
             snap_dict['id'],
-            snap_dict['name'])
+            snap_dict['id'])
 
         return None, []
 
@@ -236,9 +237,6 @@ class CephFSNativeDriver(driver.ShareDriver,):
         # I consume no manila-tracked network resources.
         return 0
 
-    # TODO: create a periodic hook for purging deleted volumes, and move the
-    # purging out of the delete_share path.
-
-    # TODO: advertise pool capabilities:
-    #  * Support for share types with data isolation
-    #  * Support for share types that specify an existing data pool
+    # TODO: create_consistency_group_from_cgsnapshot
+    # TODO: create_share_from_snapshot
+    # TODO: purge volumes in the background instead of inline in delete_share

@@ -17,12 +17,15 @@
 import json
 import logging
 import os
+import threading
 
 import rados
 import cephfs
 
 # Generate missing lib errors at load time, rather than the
 # first time someone tries to use the FS
+import errno
+
 try:
     cephfs.load_libcephfs()
 except EnvironmentError as e:
@@ -39,15 +42,14 @@ class RadosError(Exception):
     pass
 
 
+CEPH_DEFAULT_AUTH_ID = "admin"
 RADOS_TIMEOUT = 10
-
 SNAP_DIR = ".snap"
 
 log = logging.getLogger(__name__)
 
 
 # TODO support multiple ceph clusters
-# TODO get ceph auth info from config database
 
 # Reserved volume group name which we use in paths for volumes
 # that
@@ -67,6 +69,137 @@ class VolumePath(object):
 
     def __str__(self):
         return "{0}/{1}".format(self.group_id, self.volume_id)
+
+
+class ClusterTimeout(Exception):
+    """
+    Exception indicating that we timed out trying to talk to the Ceph cluster,
+    either to the mons, or to any individual daemon that the mons indicate ought
+    to be up but isn't responding to us.
+    """
+    pass
+
+
+class ClusterError(Exception):
+    """
+    Exception indicating that the cluster returned an error to a command that
+    we thought should be successful based on our last knowledge of the cluster
+    state.
+    """
+    def __init__(self, action, result_code, result_str):
+        self._action = action
+        self._result_code = result_code
+        self._result_str = result_str
+
+    def __str__(self):
+        return "Error {0} (\"{1}\") while {2}".format(
+            self._result_code, self._result_str, self._action)
+
+
+class RankEvicter(threading.Thread):
+    """
+    Thread for evicting client(s) from a particular MDS daemon instance.
+
+    This is more complex than simply sending a command, because we have to
+    handle cases where MDS daemons might not be fully up yet, and/or might
+    be transiently unresponsive to commands.
+    """
+    class GidGone(Exception):
+        pass
+
+    POLL_PERIOD = 5
+
+    def __init__(self, volume_client, client_spec, rank, gid, mds_map, ready_timeout):
+        """
+        :param client_spec: list of strings, used as filter arguments to "session evict"
+                            pass ["id=123"] to evict a single client with session id 123.
+        """
+        self.rank = rank
+        self.gid = gid
+        self._mds_map = mds_map
+        self._client_spec = client_spec
+        self._volume_client = volume_client
+        self._ready_timeout = ready_timeout
+        self._ready_waited = 0
+
+        self.success = False
+        self.exception = None
+
+        super(RankEvicter, self).__init__()
+
+    def _ready_to_evict(self):
+        if self._mds_map['up'].get("mds_{0}".format(self.rank), None) != self.gid:
+            log.info("Evicting {0} from {1}/{2}: rank no longer associated with gid, done.".format(
+                self._client_spec,
+            ))
+            raise RankEvicter.GidGone()
+
+        info = self._mds_map['info']["gid_{0}".format(self.gid)]
+        return info['state'] in ["up:active", "up:clientreplay"]
+
+    def _wait_for_ready(self):
+        """
+        Wait for that MDS rank to reach an active or clientreplay state, and
+        not be laggy.
+        """
+        while not self._ready_to_evict():
+            if self._ready_waited > self._ready_timeout:
+                raise ClusterTimeout()
+
+            time.sleep(self.POLL_PERIOD)
+            self._ready_waited += self.POLL_PERIOD
+
+            self._mds_map = self._volume_client._rados_command("mds dump", {})
+
+    def _evict(self):
+        """
+        Run the eviction procedure.  Return true on success, false on errors.
+        """
+
+        # Wait til the MDS is believed by the mon to be available for commands
+        try:
+            self._wait_for_ready()
+        except self.GidGone:
+            return True
+
+        # Then send it an evict
+        ret = errno.ETIMEDOUT
+        while ret == errno.ETIMEDOUT:
+            log.debug("mds_command: {0}, {1}".format(
+                "%s" % self.gid, ["session", "evict"] + self._client_spec
+            ))
+            ret, outb, outs = self._volume_client.fs.mds_command(
+                "%s" % self.gid,
+                json.dumps({
+                                "prefix": "session evict",
+                                "filters": self._client_spec
+                }), "")
+
+            # If we get a clean response, great, it's gone from that rank.
+            if ret == 0:
+                return True
+            elif ret == errno.ETIMEDOUT:
+                # Oh no, the MDS went laggy (that's how libcephfs knows to emit this error)
+                self._mds_map = self._volume_client._rados_command("mds dump", {})
+                try:
+                    self._wait_for_ready()
+                except self.GidGone:
+                    return True
+            else:
+                raise ClusterError("Sending evict to mds.{0}".format(self.gid), ret, outs)
+
+    def run(self):
+        try:
+            self._evict()
+        except Exception, e:
+            self.success = False
+            self.exception = e
+        else:
+            self.success = True
+
+
+class EvictionError(Exception):
+    pass
 
 
 class CephFSVolumeClient(object):
@@ -90,15 +223,54 @@ class CephFSVolumeClient(object):
 
     # Where shall we create our volumes?
     VOLUME_PREFIX = "/volumes"
-    RADOS_NAME = "client.manila"
     POOL_PREFIX = "manila_"
 
-    def __init__(self, conf_path, cluster_name):
+    def __init__(self, auth_id, conf_path, cluster_name):
         self.fs = None
         self.rados = None
         self.connected = False
         self.conf_path = conf_path
         self.cluster_name = cluster_name
+        self.auth_id = auth_id
+
+    def evict(self, auth_id, timeout=30):
+        """
+        Evict all clients using this authorization ID. Assumes that the
+        authorisation key has been revoked prior to calling this function.
+
+        This operation can throw an exception if the mon cluster is unresponsive, or
+        any individual MDS daemon is unresponsive for longer than the timeout passed in.
+        """
+
+        log.info("evict: {0}".format(auth_id))
+
+        mds_map = self._rados_command("mds dump", {})
+
+        up = {}
+        for name, gid in mds_map['up'].items():
+            # Quirk of the MDSMap JSON dump: keys in the up dict are like "mds_0"
+            assert name.startswith("mds_")
+            up[int(name[4:])] = gid
+
+        # For all MDS ranks held by a daemon
+        # Do the parallelism in python instead of using "tell mds.*", because
+        # the latter doesn't give us per-mds output
+        threads = []
+        for rank, gid in up.items():
+            thread = RankEvicter(self, ["auth_name={0}".format(auth_id)], rank, gid, mds_map, timeout)
+            thread.start()
+            threads.append(thread)
+
+        for t in threads:
+            t.join()
+
+        for t in threads:
+            if not t.success:
+                msg = "Failed to evict client {0} from mds {1}/{2}: {3}".format(
+                    auth_id, t.rank, t.gid, t.exception
+                )
+                log.error(msg)
+                raise EvictionError(msg)
 
     def _get_path(self, volume_path):
         """
@@ -117,12 +289,9 @@ class CephFSVolumeClient(object):
         )
 
     def connect(self):
-        # TODO: optionally evict any other CephFS client with my client ID
-        # so that a hard restart of manila doesn't have to wait for its
-        # previous client instance's session to time out.
         log.debug("Connecting to RADOS with config {0}...".format(self.conf_path))
         self.rados = rados.Rados(
-            name=self.RADOS_NAME,
+            name="client.{0}".format(self.auth_id),
             clustername=self.cluster_name,
             conffile=self.conf_path,
             conf={}
@@ -130,8 +299,14 @@ class CephFSVolumeClient(object):
         self.rados.connect()
 
         log.debug("Connection to RADOS complete")
+
         log.debug("Connecting to cephfs...")
         self.fs = cephfs.LibCephFS(rados_inst=self.rados)
+        self.fs.init()
+        if self.auth_id != CEPH_DEFAULT_AUTH_ID:
+            # Evict any other manila sessions.  Only do this if we're using a client ID
+            # that isn't the default admin ID, to avoid rudely disrupting anyone else.
+            self.evict(self.auth_id)
         self.fs.mount()
         log.debug("Connection to cephfs complete")
 
@@ -340,15 +515,14 @@ class CephFSVolumeClient(object):
         :return:
         """
 
-        # TODO: evict any clients that were using this: deleting the auth key
-        # will stop new clients connecting, but it doesn't guarantee that any
-        # existing clients have gone.
         log.info("delete_volume: {0}".format(volume_path))
 
         client_entity = "client.{0}".format(volume_path.volume_id)
 
         # Remove the auth key for this volume
         self._rados_command('auth del', {'entity': client_entity}, decode=False)
+
+        self.evict(volume_path.volume_id)
 
         # Create the trash folder if it doesn't already exist
         trash = os.path.join(self.VOLUME_PREFIX, "_deleting")
@@ -373,12 +547,6 @@ class CephFSVolumeClient(object):
             log.warning("Trying to purge volume '{0}' but it's already been purged".format(
                 trashed_volume))
             return
-
-        # TODO: delete the consistency group if it's empty now
-        # TODO: we must delete all the snapshots explicitly during purge
-
-        # FIXME: warn somehow that when someone deletes a volume that was in a consistency group,
-        # we can't clear out snapshots until the consistency group is empty?
 
         def rmtree(root_path):
             log.debug("rmtree {0}".format(root_path))
@@ -468,6 +636,7 @@ class CephFSVolumeClient(object):
         )
 
     def _snapshot_create(self, dir_path, snapshot_name):
+        # TODO: raise intelligible exception for clusters where snaps are disabled
         self.fs.mkdir(self._snapshot_path(dir_path, snapshot_name), 0755)
 
     def _snapshot_destroy(self, dir_path, snapshot_name):
@@ -494,5 +663,17 @@ class CephFSVolumeClient(object):
     def destroy_snapshot_group(self, group_id, snapshot_name):
         if group_id is None:
             raise RuntimeError("Group ID may not be None")
+        if snapshot_name is None:
+            raise RuntimeError("Snapshot name may not be None")
 
         return self._snapshot_destroy(self._get_group_path(group_id), snapshot_name)
+
+    def _cp_r(self, src, dst):
+        # TODO
+        raise NotImplementedError()
+
+    def clone_volume_to_existing(self, dest_volume_path, src_volume_path, src_snapshot_name):
+        dest_fs_path = self._get_path(dest_volume_path)
+        src_snapshot_path = self._snapshot_path(self._get_path(src_volume_path), src_snapshot_name)
+
+        self._cp_r(src_snapshot_path, dest_fs_path)
