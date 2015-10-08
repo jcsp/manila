@@ -19,7 +19,10 @@ from oslo_config import cfg
 
 import manila.exception as exception
 from manila.share import driver
+from manila.share import share_types
 
+
+CEPH_DEFAULT_AUTH_ID = "admin"
 
 
 log = log.getLogger(__name__)
@@ -83,7 +86,7 @@ class CephFSNativeDriver(driver.ShareDriver,):
             return self._volume_client
 
         try:
-            from volume_client import CephFSVolumeClient
+            from ceph_volume_client import CephFSVolumeClient
         except ImportError as e:
             raise exception.ManilaException(
                 "Ceph client libraries not found: {0}".format(
@@ -96,8 +99,14 @@ class CephFSNativeDriver(driver.ShareDriver,):
             auth_id = self.configuration.safe_get('cephfs_auth_id')
             self._volume_client = CephFSVolumeClient(auth_id, conf_path, cluster_name)
             log.info("Ceph client found, connecting...")
+            if auth_id != CEPH_DEFAULT_AUTH_ID:
+                # Evict any other manila sessions.  Only do this if we're using a client ID
+                # that isn't the default admin ID, to avoid rudely disrupting anyone else.
+                premount_evict = auth_id
+            else:
+                premount_evict = None
             try:
-                self._volume_client.connect()
+                self._volume_client.connect(premount_evict=premount_evict)
             except Exception:
                 self._volume_client = None
                 raise
@@ -145,33 +154,44 @@ class CephFSNativeDriver(driver.ShareDriver,):
         log.info("create_share name={0} size={1} cg_id={2}".format(
             share['share_id'], share['size'], share['consistency_group_id']))
 
-        # TODO: resolve share_type_id to a sharetype and look at its KVs
-        # to decide whether it should be data isolated.
+        extra_specs = share_types.get_extra_specs_from_share(share)
+        data_isolated = extra_specs.get("data_isolated", False)
 
         size = self._to_bytes(share['size'])
 
+        # Create the CephFS volume
         volume = self.volume_client.create_volume(
-            self._share_path(share), size=size, data_isolated=True)
+            self._share_path(share), size=size, data_isolated=data_isolated)
+
+        # Create a global auth identity for the volume (we do not implement
+        # allow/deny in this driver, access to the share's export location
+        # is access to the share)
+        auth_name = share['share_id']
+        auth_key = self._volume_client.authorize(self._share_path(share), auth_name)
 
         # To mount this you need to know the mon IPs, the volume name, and they key
-        key = volume['volume_key']
         mon_addrs = self.volume_client.get_mon_addrs()
 
         export_location = "{0}:{1}:{2}".format(
             ",".join(mon_addrs),
             volume['mount_path'],
-            key)
+            auth_key)
 
         log.info("Calculated export location: {0}".format(export_location))
 
         return export_location
 
     def delete_share(self, context, share, share_server=None):
-        self.volume_client.delete_volume(self._share_path(share), data_isolated=True)
+        extra_specs = share_types.get_extra_specs_from_share(share)
+        data_isolated = extra_specs.get("data_isolated", False)
+
+        auth_name = share['share_id']
+        self.volume_client.evict(auth_name)
+        self.volume_client.deauthorize(self._share_path(share), auth_name)
+        self.volume_client.delete_volume(self._share_path(share), data_isolated=data_isolated)
 
     def ensure_share(self, context, share, share_server=None):
         # Creation is idempotent
-        assert share is not None
         return self.create_share(context, share, share_server)
 
     def extend_share(self, share, new_size, share_server=None):
