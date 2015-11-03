@@ -54,8 +54,7 @@ class CephFSNativeDriver(driver.ShareDriver,):
     """
 
     supported_protocols = ('CEPHFS',)
-
-    driver_handles_share_servers = True
+    driver_handles_share_servers = False
 
     # We support snapshots, but not creating shares from them (yet)
     _snapshots_are_supported = True
@@ -132,12 +131,6 @@ class CephFSNativeDriver(driver.ShareDriver,):
         from ceph_volume_client import VolumePath
         return VolumePath(share['consistency_group_id'], share['share_id'])
 
-    def _teardown_server(self, server_details, security_services=None):
-        log.warning("Skipping teardown_server, this driver doesn't use that")
-
-    def _setup_server(self, network_info, metadata=None):
-        log.warning("Skipping teardown_server, this driver doesn't use that")
-
     def create_share(self, context, share, share_server=None):
         """
 
@@ -147,8 +140,7 @@ class CephFSNativeDriver(driver.ShareDriver,):
         :return:
         """
 
-        if share_server is not None:
-            log.warning("You specified a share server, but this driver doesn't use that")
+        assert share_server is None
 
         # `share` is a ShareInstance
         log.info("create_share name={0} size={1} cg_id={2}".format(
@@ -253,9 +245,6 @@ class CephFSNativeDriver(driver.ShareDriver,):
             self._volume_client.disconnect()
             self._volume_client = None
 
-    def get_network_allocations_number(self):
-        # I consume no manila-tracked network resources.
-        return 0
 
     # TODO: create_consistency_group_from_cgsnapshot
     # TODO: create_share_from_snapshot
