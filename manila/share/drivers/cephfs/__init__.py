@@ -129,7 +129,7 @@ class CephFSNativeDriver(driver.ShareDriver,):
         """
         Get VolumePath from ShareInstance
         """
-        from manila.share.drivers.cephfs.volume_client import VolumePath
+        from ceph_volume_client import VolumePath
         return VolumePath(share['consistency_group_id'], share['share_id'])
 
     def _teardown_server(self, server_details, security_services=None):
@@ -260,3 +260,6 @@ class CephFSNativeDriver(driver.ShareDriver,):
     # TODO: create_consistency_group_from_cgsnapshot
     # TODO: create_share_from_snapshot
     # TODO: purge volumes in the background instead of inline in delete_share
+    # TODO: populate total_capcity_gb etc capabilities
+    # TODO: update openstack-manuals
+    # TODO: 90% unit test coverage (1. just set volume_client to a Mock, 2. profit)
