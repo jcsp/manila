@@ -51,9 +51,9 @@ class CapabilitiesFilter(filters.BaseHostFilter):
                 if cap is None:
                     return False
             if not extra_specs_ops.match(cap, req):
-                LOG.debug("extra_spec requirement '%(req)s' "
+                LOG.debug("extra_spec key '%(key)s' requirement '%(req)s' "
                           "does not match '%(cap)s'",
-                          {'req': req, 'cap': cap})
+                          {'key': key, 'req': req, 'cap': cap})
                 return False
         return True
 
