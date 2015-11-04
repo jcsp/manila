@@ -1084,7 +1084,7 @@ class ShareManager(manager.SchedulerDependentManager):
             share_instance = self.db.share_instance_get(
                 context, share_instance_id, with_share_data=True)
             share_server = self._get_share_server(context, share_instance)
-            self.driver.allow_access(context, share_instance, access_ref,
+            key = self.driver.allow_access(context, share_instance, access_ref,
                                      share_server=share_server)
             self.db.share_instance_access_update_state(
                 context, access_mapping['id'], access_mapping.STATE_ACTIVE)

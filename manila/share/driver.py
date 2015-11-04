@@ -583,7 +583,10 @@ class ShareDriver(object):
         raise NotImplementedError()
 
     def allow_access(self, context, share, access, share_server=None):
-        """Allow access to the share."""
+        """Allow access to the share.
+
+        :return None or a string to set ShareAccessMapping.access_key
+        """
         raise NotImplementedError()
 
     def deny_access(self, context, share, access, share_server=None):

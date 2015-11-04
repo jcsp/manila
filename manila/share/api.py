@@ -876,6 +876,7 @@ class API(base.Base):
                  'access_type': rule.access_type,
                  'access_to': rule.access_to,
                  'access_level': rule.access_level,
+                 'access_key': rule.access_key,
                  'state': rule.state} for rule in rules]
 
     def access_get(self, context, access_id):

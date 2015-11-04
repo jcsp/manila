@@ -1671,11 +1671,13 @@ def share_instance_access_delete(context, mapping_id):
 
 @require_context
 @oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
-def share_instance_access_update_state(context, mapping_id, state):
+def share_instance_access_update_state(context, mapping_id, state, key):
     session = get_session()
     with session.begin():
         mapping = session.query(models.ShareInstanceAccessMapping).\
             filter_by(id=mapping_id).first()
+        if key is not None:
+            mapping.update({'access_key': key})
         mapping.update({'state': state})
         mapping.save(session=session)
         return mapping
