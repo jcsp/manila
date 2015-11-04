@@ -17,11 +17,15 @@
 from oslo_log import log
 from oslo_config import cfg
 
+from manila.i18n import _
 import manila.exception as exception
 from manila.share import driver
 from manila.share import share_types
 
 
+CEPHX_ACCESS_TYPE = "cephx"
+
+# The default Ceph administrative identity
 CEPH_DEFAULT_AUTH_ID = "admin"
 
 
@@ -172,6 +176,19 @@ class CephFSNativeDriver(driver.ShareDriver,):
         log.info("Calculated export location: {0}".format(export_location))
 
         return export_location
+
+    def allow_access(self, context, share, access, share_server=None):
+        if access['access_type'] != CEPHX_ACCESS_TYPE:
+            raise exception.InvalidShareAccess(_("Only 'cephx' access type allowed"))
+
+        ceph_auth_id = access['access_to']
+
+        ceph_auth_key = self.volume_client.authorize(self._share_path(share), ceph_auth_id)
+
+        return ceph_auth_key
+
+    def deny_access(self, context, share, access, share_server=None):
+        self.volume_client.deauthorize(self._share_path(share), access['access_to'])
 
     def delete_share(self, context, share, share_server=None):
         extra_specs = share_types.get_extra_specs_from_share(share)
