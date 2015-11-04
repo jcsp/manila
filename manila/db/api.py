@@ -438,6 +438,11 @@ def share_access_get_all_for_share(context, share_id):
     return IMPL.share_access_get_all_for_share(context, share_id)
 
 
+def share_access_update_key(context, access_id, key):
+    """Update the access_key field of a share access mapping."""
+    return IMPL.share_access_update_key(context, access_id, key)
+
+
 def share_instance_access_get_all(context, access_id, session=None):
     """Get access rules to all share instances."""
     return IMPL.share_instance_access_get_all(context, access_id, session=None)

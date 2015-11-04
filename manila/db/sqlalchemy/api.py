@@ -1644,6 +1644,17 @@ def share_access_delete_all_by_share(context, share_id):
 
 
 @require_context
+def share_access_update_key(context, access_id, key):
+    session = get_session()
+    with session.begin():
+        mapping = session.query(models.ShareAccessMapping).\
+            filter_by(id=access_id).first()
+        mapping.update({'access_key': key})
+        mapping.save(session=session)
+        return mapping
+
+
+@require_context
 def share_instance_access_delete(context, mapping_id):
     session = get_session()
     with session.begin():
