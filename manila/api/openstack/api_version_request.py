@@ -55,13 +55,14 @@ REST_API_VERSION_HISTORY = """
     * 2.7 - Rename old extension-like API URLs to core-API-like
     * 2.8 - Attr "is_public" can be set for share using API "manage"
     * 2.9 - Add export locations API
+    * 2.10 - Add "cephx" auth type to allow_access
 """
 
 # The minimum and maximum versions of the API supported
 # The default api version request is defined to be the
 # the minimum version of the API supported.
 _MIN_API_VERSION = "2.0"
-_MAX_API_VERSION = "2.9"
+_MAX_API_VERSION = "2.10"
 DEFAULT_API_VERSION = _MIN_API_VERSION
 
 

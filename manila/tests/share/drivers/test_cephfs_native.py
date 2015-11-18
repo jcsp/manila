@@ -1,0 +1,257 @@
+# Copyright (c) 2016 Red Hat, Inc.
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+
+import sys
+
+import mock
+from oslo_config import cfg
+from oslo_utils import units
+
+from manila import context
+from manila.db.sqlalchemy import models
+from manila.share import configuration
+from manila.share.drivers import cephfs
+from manila.share import share_types
+from manila import test
+from manila.tests.db import fakes as db_fakes
+from manila.tests import fake_share
+
+CONF = cfg.CONF
+
+
+def fake_share_instance(base_share=None, **kwargs):
+    if base_share is None:
+        share = fake_share.fake_share()
+    else:
+        share = base_share
+
+    share_instance = {
+        'share_id': share['id'],
+        'id': "fakeinstanceid",
+        'status': "active",
+    }
+
+    for attr in models.ShareInstance._proxified_properties:
+        share_instance[attr] = getattr(share, attr, None)
+
+    return db_fakes.FakeModel(share_instance)
+
+
+class VolumePath(object):
+    """Copy of VolumePath from CephFSVolumeClient."""
+
+    def __init__(self, group_id, volume_id):
+        self.group_id = group_id
+        self.volume_id = volume_id
+
+    def __eq__(self, other):
+        return (self.group_id == other.group_id
+                and self.volume_id == other.volume_id)
+
+    def __str__(self):
+        return "{0}/{1}".format(self.group_id, self.volume_id)
+
+
+class MockVolumeClientModule(object):
+    """Mocked up version of ceph's VolumeClient interface."""
+    VolumePath = VolumePath
+
+    class CephFSVolumeClient(mock.Mock):
+        def __init__(self, *args, **kwargs):
+            mock.Mock.__init__(self, spec=[
+                "connect", "disconnect",
+                "create_snapshot_volume", "destroy_snapshot_volume",
+                "create_group", "destroy_group",
+                "delete_volume", "purge_volume",
+                "deauthorize", "evict", "set_max_bytes",
+                "destroy_snapshot_group", "create_snapshot_group"
+            ])
+            self.create_volume = mock.Mock(return_value={
+                "mount_path": "/foo/bar"
+            })
+            self.get_mon_addrs = mock.Mock(return_value=["1.2.3.4", "5.6.7.8"])
+            self.authorize = mock.Mock(return_value={"auth_key": "abc123"})
+            self.get_used_bytes = mock.Mock(return_value=0)
+
+
+class CephFSNativeDriverTestCase(test.TestCase):
+    """Test the CephFS native driver.
+
+    This is a very simple driver that mainly
+    calls through to the CephFSVolumeClient interface, so the tests validate
+    that the Manila driver calls map to the appropriate CephFSVolumeClient
+    calls.
+    """
+
+    def setUp(self):
+        super(CephFSNativeDriverTestCase, self).setUp()
+        self.fake_conf = configuration.Configuration(None)
+        self._context = context.get_admin_context()
+        self._share_instance = fake_share_instance(fake_share.fake_share(
+            share_proto='CEPHFS'))
+
+        # As soon as the driver tries to initialize volume_client, it'll
+        # see our fake instead
+        sys.modules["ceph_volume_client"] = MockVolumeClientModule
+
+        self._driver = cephfs.CephFSNativeDriver(configuration=self.fake_conf)
+
+        self.mock_object(share_types, 'get_share_type_extra_specs',
+                         mock.Mock(return_value={}))
+
+    def test_create_share(self):
+        export_location = self._driver.create_share(self._context,
+                                                    self._share_instance)
+        self.assertEqual("1.2.3.4,5.6.7.8:/foo/bar", export_location)
+        self._driver._volume_client.create_volume.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            size=self._share_instance['size'] * units.Gi,
+            data_isolated=False)
+
+    def test_ensure_share(self):
+        self._driver.ensure_share(self._context,
+                                  self._share_instance)
+        self._driver._volume_client.create_volume.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            size=self._share_instance['size'] * units.Gi,
+            data_isolated=False)
+
+    def test_create_data_isolated(self):
+        self.mock_object(share_types, 'get_share_type_extra_specs',
+                         mock.Mock(return_value={"data_isolated": True}))
+        self._driver.create_share(self._context, self._share_instance)
+        self._driver._volume_client.create_volume.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            size=self._share_instance['size'] * units.Gi,
+            data_isolated=True)
+
+    def test_delete_share(self):
+        self._driver.delete_share(self._context, self._share_instance)
+        self._driver._volume_client.delete_volume.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            data_isolated=False)
+        self._driver._volume_client.purge_volume.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            data_isolated=False)
+
+    def test_delete_data_isolated(self):
+        self.mock_object(share_types, 'get_share_type_extra_specs',
+                         mock.Mock(return_value={"data_isolated": True}))
+        self._driver.delete_share(self._context, self._share_instance)
+        self._driver._volume_client.delete_volume.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            data_isolated=True)
+        self._driver._volume_client.purge_volume.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            data_isolated=True)
+
+    def test_allow_access(self):
+        self._driver.allow_access(self._context, self._share_instance, {
+            'access_level': 'rw',
+            'access_type': 'cephx',
+            'access_to': 'alice'
+        })
+
+        self._driver._volume_client.authorize.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            "alice")
+
+    def test_deny_access(self):
+        self._driver.deny_access(self._context, self._share_instance, {
+            'access_level': 'rw',
+            'access_type': 'cephx',
+            'access_to': 'alice'
+        })
+
+        self._driver._volume_client.deauthorize.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            "alice")
+
+    def test_extend_share(self):
+        new_size_gb = self._share_instance['size'] * 2
+        new_size = new_size_gb * units.Gi
+        self._driver.extend_share(self._share_instance, new_size_gb, None)
+        self._driver._volume_client.set_max_bytes.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            new_size)
+
+    def test_shrink_share(self):
+        new_size_gb = self._share_instance['size'] * 0.5
+        new_size = new_size_gb * units.Gi
+        self._driver.shrink_share(self._share_instance, new_size_gb, None)
+        self._driver._volume_client.get_used_bytes.assert_called_once_with(
+            self._driver._share_path(self._share_instance))
+        self._driver._volume_client.set_max_bytes.assert_called_once_with(
+            self._driver._share_path(self._share_instance),
+            new_size)
+
+    def test_create_snapshot(self):
+        self._driver.create_snapshot(self._context,
+                                     {
+                                         "share": self._share_instance,
+                                         "name": "snappy1"
+                                     },
+                                     None)
+        (self._driver._volume_client.create_snapshot_volume
+            .assert_called_once_with(
+                self._driver._share_path(self._share_instance),
+                "snappy1"))
+
+    def test_delete_snapshot(self):
+        self._driver.delete_snapshot(self._context,
+                                     {
+                                         "share": self._share_instance,
+                                         "name": "snappy1"
+                                     },
+                                     None)
+        (self._driver._volume_client.destroy_snapshot_volume
+            .assert_called_once_with(
+                self._driver._share_path(self._share_instance),
+                "snappy1"))
+
+    def test_create_consistency_group(self):
+        self._driver.create_consistency_group(self._context,
+                                              {
+                                                  "id": "grp1"
+                                              },
+                                              None)
+        self._driver._volume_client.create_group.assert_called_once_with(
+            "grp1")
+
+    def test_delete_consistency_group(self):
+        self._driver.delete_consistency_group(self._context,
+                                              {
+                                                  "id": "grp1"
+                                              },
+                                              None)
+        self._driver._volume_client.destroy_group.assert_called_once_with(
+            "grp1")
+
+    def test_create_cg_snapshot(self):
+        self._driver.create_cgsnapshot(self._context, {
+            'consistency_group_id': 'cgid',
+            'id': 'snapid'
+        })
+        (self._driver._volume_client.create_snapshot_group.
+         assert_called_once_with("cgid", "snapid"))
+
+    def test_delete_cgsnapshot(self):
+        self._driver.delete_cgsnapshot(self._context, {
+            'consistency_group_id': 'cgid',
+            'id': 'snapid'
+        })
+        (self._driver._volume_client.destroy_snapshot_group.
+         assert_called_once_with("cgid", "snapid"))

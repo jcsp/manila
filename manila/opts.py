@@ -112,6 +112,7 @@ _global_opt_lists = [
     manila.share.driver.share_opts,
     manila.share.driver.ssh_opts,
     manila.share.drivers_private_data.private_data_opts,
+    manila.share.drivers.cephfs.cephfs_native_opts,
     manila.share.drivers.emc.driver.EMC_NAS_OPTS,
     manila.share.drivers.generic.share_opts,
     manila.share.drivers.glusterfs.common.glusterfs_common_opts,
