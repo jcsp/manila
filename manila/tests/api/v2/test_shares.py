@@ -964,6 +964,55 @@ class ShareAPITest(test.TestCase):
         common.remove_invalid_options(ctx, search_opts, allowed_opts)
         self.assertEqual(expected_opts, search_opts)
 
+    @ddt.data(
+        {'access_type': 'ip', 'access_to': '127.0.0.1'},
+        {'access_type': 'user', 'access_to': '1' * 4},
+        {'access_type': 'user', 'access_to': '1' * 32},
+        {'access_type': 'user', 'access_to': 'fake\\]{.-_\'`;}['},
+        {'access_type': 'user', 'access_to': 'MYDOMAIN\\Administrator'},
+        {'access_type': 'cert', 'access_to': 'x'},
+        {'access_type': 'cert', 'access_to': 'tenant.example.com'},
+        {'access_type': 'cert', 'access_to': 'x' * 64},
+    )
+    def test_allow_access(self, access):
+        self.mock_object(share_api.API,
+                         'allow_access',
+                         mock.Mock(return_value={'fake': 'fake'}))
+
+        id = 'fake_share_id'
+        body = {'allow_access': access}
+        expected = {'access': {'fake': 'fake'}}
+        req = fakes.HTTPRequest.blank(
+            '/v2/tenant1/shares/%s/action' % id,
+            version="2.11"
+        )
+        res = self.controller.allow_access(req, id, body)
+        self.assertEqual(expected, res)
+
+    @ddt.data(
+        {'access_type': 'error_type', 'access_to': '127.0.0.1'},
+        {'access_type': 'ip', 'access_to': 'localhost'},
+        {'access_type': 'ip', 'access_to': '127.0.0.*'},
+        {'access_type': 'ip', 'access_to': '127.0.0.0/33'},
+        {'access_type': 'ip', 'access_to': '127.0.0.256'},
+        {'access_type': 'user', 'access_to': '1'},
+        {'access_type': 'user', 'access_to': '1' * 3},
+        {'access_type': 'user', 'access_to': '1' * 33},
+        {'access_type': 'user', 'access_to': 'root^'},
+        {'access_type': 'cert', 'access_to': ''},
+        {'access_type': 'cert', 'access_to': ' '},
+        {'access_type': 'cert', 'access_to': 'x' * 65},
+    )
+    def test_allow_access_error(self, access):
+        id = 'fake_share_id'
+        body = {'allow_access': access}
+        req = fakes.HTTPRequest.blank(
+            '/v2/tenant1/shares/%s/action' % id,
+            version="2.11"
+        )
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.allow_access, req, id, body)
+
 
 def _fake_access_get(self, ctxt, access_id):
 
@@ -1008,7 +1057,7 @@ class ShareActionsTest(test.TestCase):
                          mock.Mock(return_value={'fake': 'fake'}))
 
         id = 'fake_share_id'
-        body = {'os-allow_access': access}
+        body = {'allow_access': access}
         expected = {'access': {'fake': 'fake'}}
         req = fakes.HTTPRequest.blank('/v1/tenant1/shares/%s/action' % id)
         res = self.controller._allow_access(req, id, body)
@@ -1030,7 +1079,7 @@ class ShareActionsTest(test.TestCase):
     )
     def test_allow_access_error(self, access):
         id = 'fake_share_id'
-        body = {'os-allow_access': access}
+        body = {'allow_access': access}
         req = fakes.HTTPRequest.blank('/v1/tenant1/shares/%s/action' % id)
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller._allow_access, req, id, body)

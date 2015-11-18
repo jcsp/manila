@@ -27,6 +27,9 @@ class FakeModel(object):
     def __getattr__(self, name):
         return self.values.get(name)
 
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+
     def __getitem__(self, key):
         if key in self.values:
             return self.values[key]
@@ -35,9 +38,6 @@ class FakeModel(object):
 
     def __repr__(self):
         return '<FakeModel: %s>' % self.values
-
-    def get(self, key, default=None):
-        return self.__getattr__(key) or default
 
     def __contains__(self, key):
         return self._getattr__(key)

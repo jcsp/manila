@@ -58,7 +58,7 @@ REST_API_VERSION_HISTORY = """
     * 2.10 - Field 'access_rules_status' was added to shares and share
             instances.
     * 2.11 - Share Replication support
-
+    * 2.12 - Add "cephx" auth type to allow_access
 """
 
 # The minimum and maximum versions of the API supported

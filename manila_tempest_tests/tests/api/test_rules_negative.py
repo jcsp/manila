@@ -317,6 +317,33 @@ class ShareCertRulesForGLUSTERFSNegativeTest(base.BaseSharesTest):
 
 
 @ddt.ddt
+class ShareCephxRulesForCEPHFSNegativeTest(base.BaseSharesTest):
+    protocol = "cephfs"
+
+    @classmethod
+    def resource_setup(cls):
+        super(ShareCephxRulesForCEPHFSNegativeTest, cls).resource_setup()
+        if not (cls.protocol in CONF.share.enable_protocols and
+                cls.protocol in CONF.share.enable_cephx_rules_for_protocols):
+            msg = ("CEPHX rule tests for %s protocol are disabled" %
+                   cls.protocol)
+            raise cls.skipException(msg)
+        # create share
+        cls.share = cls.create_share(cls.protocol)
+        cls.access_type = "cephx"
+        if CONF.share.run_snapshot_tests:
+            # create snapshot
+            cls.snap = cls.create_snapshot_wait_for_active(cls.share["id"])
+
+    @test.attr(type=["negative", "gate", ])
+    @ddt.data('jane.doe', u"bj\u00F6rn")
+    def test_create_access_rule_cephx_with_invalid_cephx_id(self, access_to):
+        self.assertRaises(lib_exc.BadRequest,
+                          self.shares_v2_client.create_access_rule,
+                          self.share["id"], self.access_type, access_to)
+
+
+@ddt.ddt
 class ShareRulesNegativeTest(base.BaseSharesTest):
     # Tests independent from rule type and share protocol
 
@@ -328,6 +355,8 @@ class ShareRulesNegativeTest(base.BaseSharesTest):
                 any(p in CONF.share.enable_user_rules_for_protocols
                     for p in cls.protocols) or
                 any(p in CONF.share.enable_cert_rules_for_protocols
+                    for p in cls.protocols) or
+                any(p in CONF.share.enable_cephx_rules_for_protocols
                     for p in cls.protocols)):
             cls.message = "Rule tests are disabled"
             raise cls.skipException(cls.message)
@@ -337,9 +366,21 @@ class ShareRulesNegativeTest(base.BaseSharesTest):
             # create snapshot
             cls.snap = cls.create_snapshot_wait_for_active(cls.share["id"])
 
+    def skip_if_cephx_access_type_not_supported_by_client(self, client):
+        if client == 'shares_client':
+            version = '1.0'
+        else:
+            version = LATEST_MICROVERSION
+        if (CONF.share.enable_cephx_rules_for_protocols and
+                utils.is_microversion_lt(version, '2.12')):
+            msg = ("API version %s does not support cephx access type, "
+                   "need version greater than 2.12." % version)
+            raise self.skipException(msg)
+
     @test.attr(type=["negative", "gate", ])
     @ddt.data('shares_client', 'shares_v2_client')
     def test_delete_access_rule_with_wrong_id(self, client_name):
+        self.skip_if_cephx_access_type_not_supported_by_client(client_name)
         self.assertRaises(lib_exc.NotFound,
                           getattr(self, client_name).delete_access_rule,
                           self.share["id"], "wrong_rule_id")
@@ -347,6 +388,7 @@ class ShareRulesNegativeTest(base.BaseSharesTest):
     @test.attr(type=["negative", "gate", ])
     @ddt.data('shares_client', 'shares_v2_client')
     def test_create_access_rule_ip_with_wrong_type(self, client_name):
+        self.skip_if_cephx_access_type_not_supported_by_client(client_name)
         self.assertRaises(lib_exc.BadRequest,
                           getattr(self, client_name).create_access_rule,
                           self.share["id"], "wrong_type", "1.2.3.4")
@@ -354,6 +396,7 @@ class ShareRulesNegativeTest(base.BaseSharesTest):
     @test.attr(type=["negative", "gate", ])
     @ddt.data('shares_client', 'shares_v2_client')
     def test_create_access_rule_ip_with_wrong_share_id(self, client_name):
+        self.skip_if_cephx_access_type_not_supported_by_client(client_name)
         self.assertRaises(lib_exc.NotFound,
                           getattr(self, client_name).create_access_rule,
                           "wrong_share_id")
@@ -363,6 +406,7 @@ class ShareRulesNegativeTest(base.BaseSharesTest):
     @testtools.skipUnless(CONF.share.run_snapshot_tests,
                           "Snapshot tests are disabled.")
     def test_create_access_rule_ip_to_snapshot(self, client_name):
+        self.skip_if_cephx_access_type_not_supported_by_client(client_name)
         self.assertRaises(lib_exc.NotFound,
                           getattr(self, client_name).create_access_rule,
                           self.snap["id"])
